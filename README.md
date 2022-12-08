@@ -36,6 +36,10 @@ ctx.set(response.headers);
 但是，如果调用时，传入了一个内网地址。就可以从外网，非法访问内网。如果应用程序对用户提供的URL和远端服务器返回的信息没有进行合适的验证和过滤，就会存在这种服务端请求伪造的缺陷，即 Server-Side Request Forgery，简称 SSRF。
 
 # 危害
+
+SSRF攻击通常会导致组织内未经授权的操作或对数据的访问，
+在某些情况下，SSRF漏洞可能允许攻击者执行任意命令执行。
+
 攻击者可以利用 SSRF 实现的攻击主要有 5 种：
 
 - 可以对外网、服务器所在内网、本地进行端口扫描，获取一些服务的 Banner 信息
@@ -45,6 +49,16 @@ ctx.set(response.headers);
 - 利用 file 协议读取服务器文件
 
 最后一条的防御，需要对协议做判断。
+
+**常见的场景函数**
+
+```golang
+http.Get(url)
+http.Post(url, contentType, body)
+http.Head(url)
+http.PostForm(url, data)
+http.NewRequest(method, url, body)
+```
 
 # 防护思路
 
@@ -62,12 +76,18 @@ ctx.set(response.headers);
   - 解析 host 获取 dns 解析后的 IP 地址
   - 检查解析后的 IP 地址是否为外网地址，过滤掉内网地址
   - 请求经过解析后的 IP 地址
+
+**关于内网地址的判断，请不要忽略IPv6的回环地址和IPv6的唯一本地地址**
+
 使用解析后的 IP 地址替换 host 请求、禁用 Redirect 跟踪：
-    如果最后一步直接传入URL直接请求,会导致再次进行DNS解析,通过 [DNS Rebinding](https://zh.wikipedia.org/wiki/DNS%E9%87%8D%E6%96%B0%E7%BB%91%E5%AE%9A%E6%94%BB%E5%87%BB) 有概率绕过 IP 地址检查从而访问内网 IP 地址.请求需要禁用 Redirect 跟踪, 如有需要跟踪 Redirect 的需求, 需再次判断 scheme、host 解析、IP 地址。保证真正请求的是经过过滤的ip地址，即可。
+    
+如果最后一步直接传入URL直接请求,会导致再次进行DNS解析,通过 [DNS Rebinding](https://zh.wikipedia.org/wiki/DNS%E9%87%8D%E6%96%B0%E7%BB%91%E5%AE%9A%E6%94%BB%E5%87%BB) 有概率绕过 IP 地址检查从而访问内网 IP 地址.请求需要禁用 Redirect 跟踪, 如有需要跟踪 Redirect 的需求, 需再次判断 scheme、host 解析、IP 地址。保证真正请求的是经过过滤的ip地址，即可。
 
 # 代码示例
 
 首先要禁用掉非http(s)协议，如果判断出请求来源协议不为http(s)，则中断请求。
+
+### 关键点1 ： 内网地址判断
 
 其次要禁用内网地址。如10，192，127开头的ip地址。这里过滤地址不要直接通过正则匹配请求地址，要通过dns查询来源域名；将所有的域名最终转换为ip，就是不管参数是ip还是域名，最终都要判断即将请求的ip地址，并过滤内网ip。同时，对dns查询错误做出处理。将所有的链接都转为ip处理。这样做的好处有，可以有效防御短连接绕过；DNS重绑绕过。
 
@@ -270,6 +290,179 @@ module.exports = app => {
 
 ```
 
+golang代码示例
+
+```golang
+// IsLocalIP 判断是否是内网ip
+// 关于内网地址的判断，请不要忽略IPv6的回环地址和IPv6的唯一本地地址
+// 因为URL形式多样，可以使用DNS解析获取规范的IP，从而判断是否是内网资源。
+func IsLocalIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	// 判断是否是回环地址,ipv4时是127.0.0.1; ipv6时是::1
+	if ip.IsLoopback() {
+		return true
+	}
+
+	// 判断ipv4是否是内网
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4[0] == 10 || // 10.0.0.0/8
+			(ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31) || // 172.16.0.0/12
+			(ip4[0] == 192 && ip4[1] == 168) // 192.168.0.0/16
+	}
+
+	// 判断ipv6是否是内网
+	if ip16 := ip.To16(); ip16 != nil {
+		// 参考 https://tools.ietf.org/html/rfc4193#section-3
+		// 参考 https://en.wikipedia.org/wiki/Private_network#Private_IPv6_addresses
+		// 判断ipv6唯一本地地址
+		return 0xfd == ip16[0]
+	}
+	// 不是ip直接返回false
+	return false
+}
+```
+
+![img_1.png](img_1.png)
+
+### 关键点2： URL跳转
+
+检测请求是否是内网资源是在正式发起请求之前，如果攻击者在请求过程中通过URL跳转进行内网资源访问则完全可以绕过回合一中的防御策略。具体攻击流程如下。
+![img_2.png](img_2.png)
+
+如图所示，通过URL跳转攻击者可获得内网资源。
+
+对于重定向有业务需求时，可以自定义http.Client的CheckRedirect。下面我们先看一下CheckRedirect的定义
+
+
+```golang
+CheckRedirect func(req *Request, via []*Request) error
+```
+req是即将发出的请求且请求中包含前一次请求的响应，via是已经发出的请求。在知晓这些条件后，防御URL跳转攻击就变得十分容易.
+
+- 根据前一次请求的响应直接拒绝307和308的跳转（此类跳转可以是POST请求，风险极高）。
+- 解析出请求的IP，并判断是否是内网IP。
+
+根据上述步骤，可如下定义http.Client。
+
+```golang
+
+// 通过自定义http.Client的CheckRedirect可以防范URL跳转攻击。
+client := &http.Client{
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		// 跳转超过10次，也拒绝继续跳转
+		if len(via) >= 10 {
+			return fmt.Errorf("redirect too much")
+		}
+		statusCode := req.Response.StatusCode
+		if statusCode == 307 || statusCode == 308 {
+			// 拒绝跳转访问
+			return fmt.Errorf("unsupport redirect method")
+		}
+		// 判断ip
+		ips, err := net.LookupIP(req.URL.Host)
+		if err != nil {
+			return err
+		}
+		for _, ip := range ips {
+			if IsLocalIP(ip) {
+				return fmt.Errorf("have local ip")
+			}
+			fmt.Printf("%s -> %s is localip?: %v\n", req.URL, ip.String(), IsLocalIP(ip))
+		}
+		return nil
+	},
+}
+```
+如上自定义CheckRedirect可以防范URL跳转攻击，但此方式会进行多次DNS解析，效率不佳
+我们在上面的node.js代码中也有类似操作，不过更加简单粗暴，直接禁止了重定向
+
+![img_3.png](img_3.png)
+
+### 关键点3 DNS Rebinding
+发起一次HTTP请求需要先请求DNS服务获取域名对应的IP地址。如果攻击者有可控的DNS服务，就可以通过DNS重绑定绕过前面的防御策略进行攻击。
+
+具体流程如下图所示
+
+![img_4.png](img_4.png)
+验证资源是是否合法时，服务器进行了第一次DNS解析，获得了一个非内网的IP且TTL为0。对解析的IP进行判断，发现非内网IP可以后续请求。由于攻击者的DNS Server将TTL设置为0，所以正式发起请求时需要再次进行DNS解析。此时DNS Server返回内网地址，由于已经进入请求资源阶段再无防御措施，所以攻击者可获得内网资源。
+
+**go dns 标准库中并没有对DNS的结果作缓存，即使TTL不为0也存在DNS重绑定的风险。**
+
+在发起请求的过程中有DNS解析才让攻击者有机可乘。如果我们能对该过程进行控制，就可以避免DNS重绑定的风险。对HTTP请求控制可以通过自定义http.Transport来实现，而自定义http.Transport也有两个方案。
+
+方案一： 
+
+```golang
+dialer := &net.Dialer{}
+transport := http.DefaultTransport.(*http.Transport).Clone()
+transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	// 解析host和 端口
+	if err != nil {
+		return nil, err
+	}
+	// dns解析域名
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return nil, err
+	}
+	// 对所有的ip串行发起请求
+	for _, ip := range ips {
+		fmt.Printf("%v -> %v is localip?: %v\n", addr, ip.String(), IsLocalIP(ip))
+		if IsLocalIP(ip) {
+			continue
+		}
+		// 非内网IP可继续访问
+		// 拼接地址
+		addr := net.JoinHostPort(ip.String(), port)
+		// 此时的addr仅包含IP和端口信息
+		con, err := dialer.DialContext(ctx, network, addr)
+		if err == nil {
+			return con, nil
+		}
+		fmt.Println(err)
+	}
+
+	return nil, fmt.Errorf("connect failed")
+}
+// 使用此client请求，可避免DNS重绑定风险
+client := &http.Client{
+	Transport: transport,
+}
+```
+
+transport.DialContext的作用是创建未加密的TCP连接，我们通过自定义此函数可规避DNS重绑定风险。另外特别说明一下，如果传递给dialer.DialContext方法的地址是常规IP格式则可使用net包中的parseIPZone函数直接解析成功，否则会继续发起DNS解析请求。
+
+方案二：
+
+```golang
+dialer := &net.Dialer{}
+dialer.Control = func(network, address string, c syscall.RawConn) error {
+    // address 已经是ip:port的格式
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%v is localip?: %v\n", address, IsLocalIP(net.ParseIP(host)))
+	return nil
+}
+transport := http.DefaultTransport.(*http.Transport).Clone()
+// 使用官方库的实现创建TCP连接
+transport.DialContext = dialer.DialContext
+// 使用此client请求，可避免DNS重绑定风险
+client := &http.Client{
+	Transport: transport,
+}
+```
+
+dialer.Control在创建网络连接之后实际拨号之前调用，且仅在go版本大于等于1.11时可用，其具体调用位置在sock_posix.go中的(*netFD).dial方法里。
+
+![img_5.png](img_5.png)
+上述两个防御方案不仅仅可以防范DNS重绑定攻击，也同样可以防范其他攻击方式。
+
+
 # 名词解释
 ### 短链接绕过
    大部分情况下这样处理是没有问题的，不过攻击者可不是一般人。这里存在一个两个可以绕过的方式，首先是短链接，短链接是先到短链接服务的地址之后再302跳转到真实服务器上，如果攻击者对内网地址进行短链处理之后以上代码会判断短链服务的 IP 为合法 IP 而通过校验。
@@ -291,4 +484,11 @@ module.exports = app => {
 
 # Reference
 
-[Server-Side Request Forgery](https://www.yuque.com/liyuan-pea35/oscp/dhrgci)
+- [Server-Side Request Forgery](https://www.yuque.com/liyuan-pea35/oscp/dhrgci)
+- [Go中的SSRF攻防战](https://juejin.cn/post/6918921211766538248)
+- [DNS Rebinding Bypass SSRF](https://xz.aliyun.com/t/8707)
+- [DNS Rebinding技术绕过SSRF/代理IP限制](https://blog.csdn.net/u011721501/article/details/54667714)
+- [DNS Rebinding based Bypass](https://github.com/incredibleindishell/SSRF_Vulnerable_Lab/blob/master/www/DNS%20Rebinding%20based%20Bypass/README.md)
+- [DNS Rebinding 攻击演示](https://github.com/izj007/wechat/blob/main/articles/%5Bsnowming%5D-2021-8-15-DNS%20Rebinding%20%E6%94%BB%E5%87%BB%E7%BB%95%E8%BF%87%20ssrf%20%E9%99%90%E5%88%B6.md)
+- [gitbook ssrf](https://gowthams.gitbook.io/bughunter-handbook/list-of-vulnerabilities-bugs/ssrf)
+- [JAVA代码审计之SSRF漏洞.md](https://github.com/Cryin/Paper/blob/master/JAVA%E4%BB%A3%E7%A0%81%E5%AE%A1%E8%AE%A1%E4%B9%8BSSRF%E6%BC%8F%E6%B4%9E.md)
